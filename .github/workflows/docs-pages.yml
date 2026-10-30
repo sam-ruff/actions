@@ -111,7 +111,9 @@ jobs:
             exit 1
           fi
 
+      # Only a deploying run uploads, so a check build in the same run cannot clash with it.
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: inputs.deploy
         with:
           path: ${{ inputs.working-directory }}/${{ inputs.site-dir }}
 
