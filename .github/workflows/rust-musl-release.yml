@@ -207,7 +207,7 @@ jobs:
         env:
           ASSET_NAME: ${{ inputs.asset-name || format('{0}-linux-amd64', inputs.binary || inputs.package) }}
         run: |
-          dist="$GITHUB_WORKSPACE/.musl-dist"
+          dist="$RUNNER_TEMP/musl-dist"
           rm -rf "$dist"
           mkdir -p "$dist"
           cp "$BINARY" "$dist/$ASSET_NAME"
@@ -219,7 +219,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ inputs.artifact-name }}
-          path: .musl-dist/
+          path: ${{ runner.temp }}/musl-dist/
           if-no-files-found: error
           retention-days: 7
 
