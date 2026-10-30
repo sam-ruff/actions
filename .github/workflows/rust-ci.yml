@@ -1,0 +1,156 @@
+name: Rust CI
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON array of runner labels. Must stay on the self-hosted pool.
+        type: string
+        default: '["self-hosted", "linux", "medium"]'
+      working-directory:
+        description: Directory holding the Cargo workspace.
+        type: string
+        default: .
+      toolchain:
+        description: Rust toolchain, such as 1.98.0. Empty uses rust-toolchain.toml.
+        type: string
+        default: stable
+      fmt:
+        description: Run cargo fmt --check.
+        type: boolean
+        default: true
+      clippy:
+        description: Run cargo clippy with -D warnings.
+        type: boolean
+        default: true
+      test:
+        description: Run cargo test.
+        type: boolean
+        default: true
+      locked:
+        description: Pass --locked to clippy and test.
+        type: boolean
+        default: true
+      clippy-args:
+        description: Arguments for cargo clippy, before the -- separator.
+        type: string
+        default: --workspace --all-targets
+      test-args:
+        description: Arguments for cargo test.
+        type: string
+        default: --workspace
+      env:
+        description: Extra environment, one KEY=VALUE per line, set for every later step.
+        type: string
+        default: ''
+      pre-command:
+        description: Shell run in the working directory after the toolchain is ready.
+        type: string
+        default: ''
+      post-command:
+        description: Shell run in the working directory after the tests.
+        type: string
+        default: ''
+      submodules:
+        description: Passed to actions/checkout (false, true or recursive).
+        type: string
+        default: 'false'
+      cache:
+        description: Cache the cargo registry and target directory.
+        type: boolean
+        default: true
+      timeout-minutes:
+        type: number
+        default: 45
+      allow-fork-pull-requests:
+        description: Run for pull requests from forks. Leave off on the self-hosted pool.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    if: inputs.allow-fork-pull-requests || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: ${{ inputs.submodules }}
+
+      - name: Extra environment
+        if: inputs.env != ''
+        env:
+          EXTRA_ENV: ${{ inputs.env }}
+        run: |
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if [[ "$line" != *=* ]]; then
+              echo "::error::env lines must be KEY=VALUE, got: $line"
+              exit 1
+            fi
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+          done <<< "$EXTRA_ENV"
+
+      - name: Toolchain
+        env:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+        run: |
+          if [ -z "$TOOLCHAIN" ]; then
+            rustup toolchain install
+            rustup component add rustfmt clippy
+            exit 0
+          fi
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          echo "RUSTUP_TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: inputs.cache
+        with:
+          workspaces: ${{ inputs.working-directory }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Pre-command
+        if: inputs.pre-command != ''
+        env:
+          COMMAND: ${{ inputs.pre-command }}
+        run: eval "$COMMAND"
+
+      - name: Format
+        if: inputs.fmt
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        if: inputs.clippy
+        env:
+          ARGS: ${{ inputs.clippy-args }}
+          LOCKED: ${{ inputs.locked && '--locked' || '' }}
+        run: |
+          # shellcheck disable=SC2086
+          cargo clippy $LOCKED $ARGS -- -D warnings
+
+      - name: Test
+        if: inputs.test
+        env:
+          ARGS: ${{ inputs.test-args }}
+          LOCKED: ${{ inputs.locked && '--locked' || '' }}
+        run: |
+          # shellcheck disable=SC2086
+          cargo test $LOCKED $ARGS
+
+      - name: Post-command
+        if: inputs.post-command != ''
+        env:
+          COMMAND: ${{ inputs.post-command }}
+        run: eval "$COMMAND"

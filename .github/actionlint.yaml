@@ -1,0 +1,14 @@
+self-hosted-runner:
+  # Labels the runner pool understands. Size labels pair with an OS label, and dedicated
+  # asks for the widest machine available.
+  labels:
+    - linux
+    - debian
+    - ubuntu
+    - windows
+    - small
+    - medium
+    - large
+    - xl
+    - dedicated
+    - avx

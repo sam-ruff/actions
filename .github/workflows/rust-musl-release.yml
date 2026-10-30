@@ -1,0 +1,254 @@
+name: Rust musl release
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON array of runner labels. Must stay on the self-hosted pool.
+        type: string
+        default: '["self-hosted", "linux", "large"]'
+      package:
+        description: Cargo package to build.
+        type: string
+        required: true
+      binary:
+        description: Binary name inside the package. Defaults to the package name.
+        type: string
+        default: ''
+      tag:
+        description: >-
+          Release tag to build and attach the binary to, such as v1.4.0. Empty builds the
+          current commit and only uploads a workflow artifact.
+        type: string
+        default: ''
+      asset-name:
+        description: File name of the release asset. Defaults to BINARY-linux-amd64.
+        type: string
+        default: ''
+      asset-label:
+        description: Label shown for the binary on the release page.
+        type: string
+        default: ''
+      artifact-name:
+        description: Workflow artifact holding the binary and its checksum, for later jobs.
+        type: string
+        default: musl-binary
+      working-directory:
+        description: Directory holding the Cargo workspace.
+        type: string
+        default: .
+      toolchain:
+        description: Rust toolchain, such as 1.98.0. Empty uses rust-toolchain.toml.
+        type: string
+        default: stable
+      cargo-args:
+        description: Extra arguments for cargo build, such as --features embed-ui.
+        type: string
+        default: ''
+      env:
+        description: Extra environment, one KEY=VALUE per line, set for every later step.
+        type: string
+        default: ''
+      pre-build-command:
+        description: >-
+          Shell run in the working directory before cargo build, for example to build a web
+          UI that the binary embeds. RELEASE_VERSION holds the version without a prefix.
+        type: string
+        default: ''
+      node-version:
+        description: Set up this Node version before the pre-build command. Empty skips it.
+        type: string
+        default: ''
+      verify-command:
+        description: Shell run after the static check. BINARY holds the binary's path.
+        type: string
+        default: ''
+      cache:
+        description: Cache the cargo registry and target directory.
+        type: boolean
+        default: true
+      timeout-minutes:
+        type: number
+        default: 60
+      allow-fork-pull-requests:
+        description: Run for pull requests from forks. Leave off on the self-hosted pool.
+        type: boolean
+        default: false
+    outputs:
+      asset-name:
+        description: File name of the binary in the artifact and on the release.
+        value: ${{ jobs.build.outputs.asset-name }}
+      artifact-name:
+        description: Workflow artifact holding the binary and its .sha256 file.
+        value: ${{ jobs.build.outputs.artifact-name }}
+      sha256:
+        description: SHA-256 of the binary.
+        value: ${{ jobs.build.outputs.sha256 }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: inputs.allow-fork-pull-requests || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    outputs:
+      asset-name: ${{ steps.package.outputs.asset-name }}
+      artifact-name: ${{ inputs.artifact-name }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    env:
+      CARGO_TERM_COLOR: always
+      CC_x86_64_unknown_linux_musl: musl-gcc
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || '' }}
+          persist-credentials: false
+
+      - name: Release version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: echo "RELEASE_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Extra environment
+        if: inputs.env != ''
+        env:
+          EXTRA_ENV: ${{ inputs.env }}
+        run: |
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if [[ "$line" != *=* ]]; then
+              echo "::error::env lines must be KEY=VALUE, got: $line"
+              exit 1
+            fi
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+          done <<< "$EXTRA_ENV"
+
+      - name: musl-gcc
+        run: |
+          if command -v musl-gcc > /dev/null; then
+            exit 0
+          fi
+          if ! sudo -n true 2> /dev/null; then
+            echo "::error::musl-gcc is missing and this runner has no passwordless sudo to install musl-tools"
+            exit 1
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Toolchain
+        env:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+        run: |
+          if [ -z "$TOOLCHAIN" ]; then
+            rustup toolchain install
+            rustup target add x86_64-unknown-linux-musl
+            exit 0
+          fi
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl
+          echo "RUSTUP_TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: inputs.cache
+        with:
+          workspaces: ${{ inputs.working-directory }}
+          key: musl
+          save-if: ${{ inputs.tag != '' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: inputs.node-version != ''
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+
+      - name: Pre-build command
+        if: inputs.pre-build-command != ''
+        env:
+          COMMAND: ${{ inputs.pre-build-command }}
+        run: eval "$COMMAND"
+
+      - name: Build
+        env:
+          PACKAGE: ${{ inputs.package }}
+          BINARY_NAME: ${{ inputs.binary || inputs.package }}
+          CARGO_ARGS: ${{ inputs.cargo-args }}
+        run: |
+          # shellcheck disable=SC2086
+          cargo build --release --locked --target x86_64-unknown-linux-musl -p "$PACKAGE" --bin "$BINARY_NAME" $CARGO_ARGS
+          target_dir=$(cargo metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)
+          echo "BINARY=$target_dir/x86_64-unknown-linux-musl/release/$BINARY_NAME" >> "$GITHUB_ENV"
+
+      - name: Binary is static
+        run: |
+          if command -v file > /dev/null; then
+            file "$BINARY"
+          fi
+          if ldd "$BINARY" 2>&1 | grep -q '=>'; then
+            echo "::error::$BINARY is dynamically linked"
+            ldd "$BINARY"
+            exit 1
+          fi
+
+      - name: Verify command
+        if: inputs.verify-command != ''
+        env:
+          COMMAND: ${{ inputs.verify-command }}
+        run: eval "$COMMAND"
+
+      - name: Package
+        id: package
+        env:
+          ASSET_NAME: ${{ inputs.asset-name || format('{0}-linux-amd64', inputs.binary || inputs.package) }}
+        run: |
+          dist="$GITHUB_WORKSPACE/.musl-dist"
+          rm -rf "$dist"
+          mkdir -p "$dist"
+          cp "$BINARY" "$dist/$ASSET_NAME"
+          (cd "$dist" && sha256sum "$ASSET_NAME" > "$ASSET_NAME.sha256")
+          echo "asset-name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d' ' -f1 "$dist/$ASSET_NAME.sha256")" >> "$GITHUB_OUTPUT"
+          cat "$dist/$ASSET_NAME.sha256"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: .musl-dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  upload:
+    needs: build
+    if: inputs.tag != ''
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: dist
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ASSET_NAME: ${{ needs.build.outputs.asset-name }}
+          ASSET_LABEL: ${{ inputs.asset-label }}
+        run: |
+          if ! command -v gh > /dev/null; then
+            echo "::error::The GitHub CLI is needed on the runner to upload release assets"
+            exit 1
+          fi
+          binary="dist/$ASSET_NAME"
+          if [ -n "$ASSET_LABEL" ]; then
+            binary="$binary#$ASSET_LABEL"
+          fi
+          gh release upload "$TAG" "$binary" "dist/$ASSET_NAME.sha256" --clobber --repo "$GITHUB_REPOSITORY"

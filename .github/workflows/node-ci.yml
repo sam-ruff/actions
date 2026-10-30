@@ -1,0 +1,166 @@
+name: Node CI
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON array of runner labels. Must stay on the self-hosted pool.
+        type: string
+        default: '["self-hosted", "linux", "medium"]'
+      working-directory:
+        description: Directory holding package.json and package-lock.json.
+        type: string
+        default: web
+      node-version:
+        type: string
+        default: 24.17.0
+      env:
+        description: Extra environment, one KEY=VALUE per line, set for every later step.
+        type: string
+        default: ''
+      pre-command:
+        description: Shell run in the working directory before npm ci.
+        type: string
+        default: ''
+      check-generated:
+        description: >-
+          Shell run after npm ci that regenerates committed files. The job fails if the
+          checkout has any change or untracked file afterwards.
+        type: string
+        default: ''
+      typecheck-script:
+        description: npm script name. Empty skips the step.
+        type: string
+        default: typecheck
+      lint-script:
+        description: npm script name. Empty skips the step.
+        type: string
+        default: lint
+      test-script:
+        description: npm script name. Empty skips the step.
+        type: string
+        default: test
+      build-script:
+        description: npm script name. Empty skips the step.
+        type: string
+        default: build
+      e2e-script:
+        description: npm script name for Playwright tests. Empty skips the browser install too.
+        type: string
+        default: ''
+      playwright-browsers:
+        description: Browsers passed to playwright install.
+        type: string
+        default: chromium
+      playwright-with-deps:
+        description: Pass --with-deps to playwright install. Needs passwordless sudo on the runner.
+        type: boolean
+        default: false
+      timeout-minutes:
+        type: number
+        default: 30
+      allow-fork-pull-requests:
+        description: Run for pull requests from forks. Leave off on the self-hosted pool.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    if: inputs.allow-fork-pull-requests || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Extra environment
+        if: inputs.env != ''
+        env:
+          EXTRA_ENV: ${{ inputs.env }}
+        run: |
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if [[ "$line" != *=* ]]; then
+              echo "::error::env lines must be KEY=VALUE, got: $line"
+              exit 1
+            fi
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+          done <<< "$EXTRA_ENV"
+
+      - name: Pre-command
+        if: inputs.pre-command != ''
+        env:
+          COMMAND: ${{ inputs.pre-command }}
+        run: eval "$COMMAND"
+
+      - run: npm ci --no-audit --no-fund
+
+      - name: Generated files are committed
+        if: inputs.check-generated != ''
+        env:
+          COMMAND: ${{ inputs.check-generated }}
+        run: |
+          eval "$COMMAND"
+          changes=$(git -C "$GITHUB_WORKSPACE" status --porcelain --untracked-files=all)
+          if [ -n "$changes" ]; then
+            echo "::error::Regenerating changed the checkout. Run the generator and commit the result."
+            echo "$changes"
+            git -C "$GITHUB_WORKSPACE" diff
+            exit 1
+          fi
+
+      - name: Typecheck
+        if: inputs.typecheck-script != ''
+        env:
+          SCRIPT: ${{ inputs.typecheck-script }}
+        run: npm run "$SCRIPT"
+
+      - name: Lint
+        if: inputs.lint-script != ''
+        env:
+          SCRIPT: ${{ inputs.lint-script }}
+        run: npm run "$SCRIPT"
+
+      - name: Test
+        if: inputs.test-script != ''
+        env:
+          SCRIPT: ${{ inputs.test-script }}
+        run: npm run "$SCRIPT"
+
+      - name: Build
+        if: inputs.build-script != ''
+        env:
+          SCRIPT: ${{ inputs.build-script }}
+        run: npm run "$SCRIPT"
+
+      - name: Install Playwright browsers
+        if: inputs.e2e-script != ''
+        env:
+          BROWSERS: ${{ inputs.playwright-browsers }}
+          WITH_DEPS: ${{ inputs.playwright-with-deps && '--with-deps' || '' }}
+        run: |
+          # shellcheck disable=SC2086
+          npx playwright install $WITH_DEPS $BROWSERS
+
+      - name: End-to-end tests
+        if: inputs.e2e-script != ''
+        env:
+          SCRIPT: ${{ inputs.e2e-script }}
+          CI: 'true'
+        run: npm run "$SCRIPT"

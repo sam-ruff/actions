@@ -1,0 +1,195 @@
+name: Container image
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON array of runner labels. Must stay on the self-hosted pool.
+        type: string
+        default: '["self-hosted", "linux", "small"]'
+      registry:
+        type: string
+        default: ghcr.io
+      image:
+        description: Image name without the registry. Defaults to the repository name, lowercased.
+        type: string
+        default: ''
+      version:
+        description: >-
+          Release version, with or without a leading v. Tags the image VERSION, MAJOR.MINOR
+          and latest. Empty tags only sha-SHORTSHA.
+        type: string
+        default: ''
+      latest:
+        description: Also tag latest when a version is given.
+        type: boolean
+        default: true
+      extra-tags:
+        description: More docker/metadata-action tag rules, one per line, such as type=raw,value=stable.
+        type: string
+        default: ''
+      ref:
+        description: Git ref to build, such as a release tag. Defaults to the triggering commit.
+        type: string
+        default: ''
+      context:
+        type: string
+        default: .
+      dockerfile:
+        description: Path to the Dockerfile, relative to the repository root.
+        type: string
+        default: Dockerfile
+      platforms:
+        type: string
+        default: linux/amd64
+      build-args:
+        description: >-
+          Build arguments, one KEY=VALUE per line. VERSION and GIT_SHA are always passed.
+        type: string
+        default: ''
+      binary-artifact:
+        description: >-
+          Workflow artifact to download before building, such as the artifact-name output of
+          rust-musl-release.yml. Files are made executable.
+        type: string
+        default: ''
+      binary-artifact-path:
+        description: Where the artifact is downloaded, relative to the repository root.
+        type: string
+        default: dist
+      push:
+        type: boolean
+        default: true
+      cache:
+        description: Use the GitHub Actions cache for build layers.
+        type: boolean
+        default: false
+      timeout-minutes:
+        type: number
+        default: 30
+      allow-fork-pull-requests:
+        description: Run for pull requests from forks. Leave off on the self-hosted pool.
+        type: boolean
+        default: false
+    secrets:
+      REGISTRY_USERNAME:
+        description: Defaults to the workflow actor, which suits GHCR.
+        required: false
+      REGISTRY_PASSWORD:
+        description: Defaults to GITHUB_TOKEN, which suits GHCR.
+        required: false
+    outputs:
+      image:
+        description: Full image name including the registry.
+        value: ${{ jobs.image.outputs.image }}
+      digest:
+        description: Manifest digest of the pushed image.
+        value: ${{ jobs.image.outputs.digest }}
+      tags:
+        description: Newline-separated list of full image references.
+        value: ${{ jobs.image.outputs.tags }}
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    if: inputs.allow-fork-pull-requests || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.name.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: inputs.binary-artifact != ''
+        with:
+          name: ${{ inputs.binary-artifact }}
+          path: ${{ inputs.binary-artifact-path }}
+
+      - name: Restore executable bits
+        if: inputs.binary-artifact != ''
+        env:
+          ARTIFACT_PATH: ${{ inputs.binary-artifact-path }}
+        run: find "$ARTIFACT_PATH" -type f ! -name '*.sha256' -exec chmod +x {} +
+
+      - name: Image name and version
+        id: name
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          IMAGE: ${{ inputs.image || github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          {
+            echo "image=$REGISTRY/${IMAGE,,}"
+            echo "version=${VERSION#v}"
+            echo "git-sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        id: meta
+        with:
+          images: ${{ steps.name.outputs.image }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.name.outputs.version }},enable=${{ steps.name.outputs.version != '' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.name.outputs.version }},enable=${{ steps.name.outputs.version != '' }}
+            type=raw,value=latest,enable=${{ inputs.latest && steps.name.outputs.version != '' }}
+            type=sha,prefix=sha-,format=short
+            ${{ inputs.extra-tags }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.name.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.name.outputs.git-sha }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        if: inputs.push
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.REGISTRY_PASSWORD || secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: build
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          build-args: |
+            VERSION=${{ steps.name.outputs.version }}
+            GIT_SHA=${{ steps.name.outputs.git-sha }}
+            ${{ inputs.build-args }}
+          cache-from: ${{ inputs.cache && 'type=gha' || '' }}
+          cache-to: ${{ inputs.cache && 'type=gha,mode=max' || '' }}
+
+      - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PUSHED: ${{ inputs.push }}
+        run: |
+          {
+            echo "Pushed: $PUSHED"
+            echo "Digest: $DIGEST"
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

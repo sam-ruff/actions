@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  actionlint:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, small]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/actionlint.sh -color
+
+  rust:
+    uses: ./.github/workflows/rust-ci.yml
+    with:
+      runs-on: '["self-hosted", "linux", "small"]'
+      working-directory: tests/fixtures/rust-app
+      env: |
+        FIXTURE_FLAG=1
+      pre-command: test "$FIXTURE_FLAG" = 1
+      post-command: cargo run --locked -q
+
+  node:
+    uses: ./.github/workflows/node-ci.yml
+    with:
+      runs-on: '["self-hosted", "linux", "small"]'
+      working-directory: tests/fixtures/web
+      check-generated: npm run generate
+
+  musl:
+    uses: ./.github/workflows/rust-musl-release.yml
+    permissions:
+      contents: write
+    with:
+      runs-on: '["self-hosted", "linux", "small"]'
+      working-directory: tests/fixtures/rust-app
+      package: hello-fixture
+      node-version: 24.17.0
+      pre-build-command: test "$(node --version)" = v24.17.0
+      verify-command: '"$BINARY" | grep -q "hello from hello-fixture"'
+
+  image:
+    needs: musl
+    uses: ./.github/workflows/container-image.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      context: tests/fixtures/image
+      dockerfile: tests/fixtures/image/Dockerfile
+      binary-artifact: ${{ needs.musl.outputs.artifact-name }}
+      binary-artifact-path: tests/fixtures/image/dist
+      version: v1.2.3
+      push: false
+
+  docs:
+    uses: ./.github/workflows/docs-pages.yml
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    with:
+      working-directory: tests/fixtures/docs
+      strict: true
+      deploy: false
+
+  release:
+    needs: [actionlint, rust, node, musl, image, docs]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/semantic-release.yml
+    permissions:
+      contents: write
+
+  major-tag:
+    needs: release
+    if: needs.release.outputs.new-release-published == 'true'
+    runs-on: [self-hosted, linux, small]
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Move the major tag
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          major="v${VERSION%%.*}"
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          git tag --force "$major" "$TAG^{commit}"
+          git push --force origin "refs/tags/$major"
+          echo "Moved $major to $TAG" >> "$GITHUB_STEP_SUMMARY"

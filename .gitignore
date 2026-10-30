@@ -1,0 +1,8 @@
+# Local-only notes for agents; see AGENTS.md. The pre-commit hook refuses to commit it.
+PRIVATE.md
+
+target/
+node_modules/
+site/
+.cache/
+.musl-dist/

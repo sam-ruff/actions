@@ -1,0 +1,138 @@
+name: Docs to GitHub Pages
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON array of runner labels. Must stay on the self-hosted pool.
+        type: string
+        default: '["self-hosted", "linux", "small"]'
+      working-directory:
+        description: Directory holding zensical.toml (or mkdocs.yml).
+        type: string
+        default: .
+      config-file:
+        description: Config file passed to zensical build -f. Empty lets Zensical find it.
+        type: string
+        default: ''
+      site-dir:
+        description: Build output, relative to the working directory.
+        type: string
+        default: site
+      zensical-version:
+        type: string
+        default: 0.0.71
+      uv-version:
+        type: string
+        default: 0.13.1
+      python-version:
+        type: string
+        default: '3.13'
+      strict:
+        description: Fail the build on warnings.
+        type: boolean
+        default: false
+      pre-command:
+        description: Shell run in the working directory before the build.
+        type: string
+        default: ''
+      deploy:
+        description: Deploy to Pages. Off builds and uploads the Pages artifact only.
+        type: boolean
+        default: true
+      timeout-minutes:
+        type: number
+        default: 20
+      allow-fork-pull-requests:
+        description: Run for pull requests from forks. Leave off on the self-hosted pool.
+        type: boolean
+        default: false
+    outputs:
+      page-url:
+        description: URL of the deployed site.
+        value: ${{ jobs.deploy.outputs.page-url }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: inputs.allow-fork-pull-requests || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ inputs.uv-version }}
+          enable-cache: false
+
+      - name: Install Zensical
+        env:
+          ZENSICAL_VERSION: ${{ inputs.zensical-version }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
+        run: |
+          venv="$RUNNER_TEMP/zensical"
+          uv venv --python "$PYTHON_VERSION" "$venv"
+          uv pip install --python "$venv/bin/python" "zensical==$ZENSICAL_VERSION"
+          echo "$venv/bin" >> "$GITHUB_PATH"
+
+      - name: Pre-command
+        if: inputs.pre-command != ''
+        env:
+          COMMAND: ${{ inputs.pre-command }}
+        run: eval "$COMMAND"
+
+      - name: Build
+        env:
+          CONFIG_FILE: ${{ inputs.config-file }}
+          STRICT: ${{ inputs.strict }}
+          SITE_DIR: ${{ inputs.site-dir }}
+        run: |
+          args=(build --clean)
+          if [ -n "$CONFIG_FILE" ]; then
+            args+=(--config-file "$CONFIG_FILE")
+          fi
+          if [ "$STRICT" = true ]; then
+            args+=(--strict)
+          fi
+          zensical "${args[@]}"
+          if [ ! -f "$SITE_DIR/index.html" ]; then
+            echo "::error::$SITE_DIR/index.html was not built"
+            exit 1
+          fi
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ inputs.working-directory }}/${{ inputs.site-dir }}
+
+  deploy:
+    needs: build
+    if: inputs.deploy
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      page-url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
